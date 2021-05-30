@@ -10,7 +10,7 @@ CREATE TABLE manufacture.manufacturer
     details jsonb
 );
 
-CREATE INDEX details_manufacturer_need_update_idx ON manufacture.manufacturer USING gin((details -> 'needUpdate'));
+CREATE INDEX details_manufacturer_need_update_idx ON manufacture.manufacturer USING gin ((details -> 'needUpdate'));
 
 INSERT INTO manufacture.manufacturer
 VALUES ('asd1asd', '{"name": "Вася", "needUpdate": true}'),
