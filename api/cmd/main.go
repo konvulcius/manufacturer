@@ -19,7 +19,7 @@ type configuration struct {
 	ReadTimeout     time.Duration `envconfig:"READ_TIMEOUT" default:"5s"`
 	WriteTimeout    time.Duration `envconfig:"WRITE_TIMEOUT" default:"5s"`
 	ShutdownTimeout time.Duration `envconfig:"SHUTDOWN_TIMEOUT" default:"5s"`
-	MetricPrefix string `envconfig:"METRIC_PREFIX" default:"metrics"`
+	MetricPrefix    string        `envconfig:"METRIC_PREFIX" default:"metrics"`
 }
 
 func main() {
