@@ -15,6 +15,9 @@ import (
 	"github.com/go-kit/kit/log/level"
 	_ "github.com/jackc/pgx/stdlib"
 	"github.com/jmoiron/sqlx"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/push"
 )
 
 type manufacturer struct {
@@ -50,6 +53,98 @@ func connect(ctx context.Context) (*sqlx.DB, error) {
 	return db, nil
 }
 
+type instrumentingMiddleware struct {
+	CliDB      *sqlx.DB
+	HTTPClient *http.Client
+	Latencies  *prometheus.HistogramVec
+}
+
+func (i *instrumentingMiddleware) getManufacturer(ctx context.Context, n int) (result []*manufacturer, err error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
+
+	defer i.recordMetrics("postgres_get", time.Now())
+
+	err = i.CliDB.SelectContext(ctx, &result, `SELECT m.id, m.details FROM manufacture.manufacturer m
+	WHERE (details ->> 'needUpdate')::boolean = true LIMIT $1`, n)
+
+	return
+}
+
+func (i *instrumentingMiddleware) doRequest(ctx context.Context, manufacturers []*manufacturer) error {
+	data, err := json.Marshal(manufacturers)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", "http://127.0.0.1:8000/api/v1/manufacturer", bytes.NewBuffer(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	req = req.WithContext(ctx)
+
+	defer i.recordMetrics("api", time.Now())
+
+	resp, err := i.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return errors.New("status code is error")
+	}
+
+	return nil
+}
+
+func (i *instrumentingMiddleware) updateManufacturer(ctx context.Context, IDs []string) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
+
+	query, args, err := sqlx.In(`UPDATE manufacture.manufacturer SET details = details|| '{"needUpdate": false}'::jsonb
+WHERE id IN (SELECT unnest(array[?]))`, IDs)
+	if err != nil {
+		return err
+	}
+	query = i.CliDB.Rebind(query)
+
+	defer i.recordMetrics("postgres_update", time.Now())
+
+	_, err = i.CliDB.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (i *instrumentingMiddleware) recordMetrics(metric string, startTime time.Time) {
+	labels := map[string]string{
+		"name": metric,
+	}
+	i.Latencies.With(labels).Observe(time.Since(startTime).Seconds())
+}
+
+func newInstrumentingMiddleware(cliDB *sqlx.DB, httpClient *http.Client) *instrumentingMiddleware {
+	return &instrumentingMiddleware{
+		CliDB:      cliDB,
+		HTTPClient: httpClient,
+		Latencies: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name: "script_api_latency",
+				Help: "Requests Latency",
+				Buckets: []float64{
+					0.01, 0.05, 0.100,
+					0.5, 0.95, 1,
+				},
+			},
+			[]string{"name"},
+		),
+	}
+}
+
 func main() {
 	n := flag.Int("n", 3, "ограничение на количество считывания данных")
 	flag.Parse()
@@ -67,11 +162,18 @@ func main() {
 
 	client := &http.Client{}
 
+	instruments := newInstrumentingMiddleware(db, client)
+	prometheus.MustRegister(instruments.Latencies)
+
+	defer func() {
+		if err := push.New("http://127.0.0.1:9091", "script_latencies").Collector(instruments.Latencies).Push(); err != nil {
+			_ = level.Error(logger).Log("msg", "failed to push metrics", "err", err)
+		}
+	}()
+
 	for {
 		// take data from db
-		var manufacturers []*manufacturer
-		err = db.SelectContext(ctx, &manufacturers, `SELECT m.id, m.details FROM manufacture.manufacturer m
-	WHERE (details ->> 'needUpdate')::boolean = true LIMIT $1`, n)
+		manufacturers, err := instruments.getManufacturer(ctx, *n)
 		if err != nil {
 			_ = level.Error(logger).Log("msg", "failed connect to get data from postgres", "err", err)
 			os.Exit(1)
@@ -81,31 +183,11 @@ func main() {
 		}
 
 		// do request to api
-		data, err := json.Marshal(manufacturers)
-		if err != nil {
-			_ = level.Error(logger).Log("msg", "failed to marshal data", "err", err)
-			os.Exit(1)
-		}
-		req, err := http.NewRequest("POST", "http://127.0.0.1:8000/api/v1/manufacturer", bytes.NewBuffer(data))
-		if err != nil {
-			_ = level.Error(logger).Log("msg", "failed to make request", "err", err)
-			os.Exit(1)
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		req = req.WithContext(ctx)
-
-		resp, err := client.Do(req)
+		err = instruments.doRequest(ctx, manufacturers)
 		if err != nil {
 			_ = level.Error(logger).Log("msg", "failed to do request", "err", err)
 			os.Exit(1)
 		}
-
-		if resp.StatusCode < 200 || resp.StatusCode > 299 {
-			_ = level.Error(logger).Log("msg", "status code is error", "err", err)
-			os.Exit(1)
-		}
-		resp.Body.Close()
 
 		// do update
 		unnestArray := make([]string, 0, len(manufacturers))
@@ -113,17 +195,9 @@ func main() {
 			unnestArray = append(unnestArray, man.ID)
 		}
 
-		query, args, err := sqlx.In(`UPDATE manufacture.manufacturer SET details = details|| '{"needUpdate": false}'::jsonb
-WHERE id IN (SELECT unnest(array[?]))`, unnestArray)
+		err = instruments.updateManufacturer(ctx, unnestArray)
 		if err != nil {
-			_ = level.Error(logger).Log("msg", "error", "err", err)
-			os.Exit(1)
-		}
-		query = db.Rebind(query)
-
-		_, err = db.ExecContext(ctx, query, args...)
-		if err != nil {
-			_ = level.Error(logger).Log("msg", "failed to update data in postgres", "err", err)
+			_ = level.Error(logger).Log("msg", "failed to update manufacturers", "err", err)
 			os.Exit(1)
 		}
 	}

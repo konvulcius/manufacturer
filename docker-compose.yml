@@ -1,0 +1,53 @@
+version: '3'
+
+volumes:
+  grafana_data: {}
+
+services:
+  postgres:
+    restart: always
+    build: ./pgsql
+    environment:
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - 54320:5432
+
+  api:
+    restart: always
+    build: ./api
+    ports:
+    - 8000:8000
+
+  prometheus:
+    restart: always
+    image: bitnami/prometheus:latest
+    links:
+      - pushgateway
+    volumes:
+      - ./prom.yml:/opt/bitnami/prometheus/conf/prometheus.yml
+    ports:
+      - 9090:9090
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=changeme
+      - GF_USERS_ALLOW_SIGN_UP=false
+    restart: unless-stopped
+    expose:
+      - 3000
+    labels:
+      org.label-schema.group: "monitoring"
+    ports:
+      - 3000:3000
+
+  pushgateway:
+    restart: always
+    image: bitnami/pushgateway:latest
+    ports:
+      - 9091:9091
