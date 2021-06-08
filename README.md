@@ -3,4 +3,4 @@
 docker-compose build        
 docker-compose up           
 
-go run ./script/script.go -n 5
+cd ./script && go run ./script.go -n 5
